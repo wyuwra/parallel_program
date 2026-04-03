@@ -1,3 +1,4 @@
 # 忽略所有 result 和 report 目录
 **/result/
 **/report/
+**/scripts/
