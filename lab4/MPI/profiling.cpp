@@ -1,0 +1,1391 @@
+#include "gkh.h"
+
+#include "givens.h"
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
+#include <vector>
+#include <iostream>
+#include <cstdlib>
+#include <mpi.h>
+#include<arm_neon.h>
+
+
+namespace
+{
+
+    // 活动块 [l, r]（闭区间）表示一个尚未完全收敛的上二对角子问题。
+    // 在该区间内，超对角线元素非零，你可以认为通过这个抽象结构给矩阵“分块”。
+    struct Block
+    {
+        int l;
+        int r;
+    };
+
+        enum MpiTag
+    {
+        TAG_SVD_BLOCK_TASK = 300,
+        TAG_SVD_BLOCK_DATA = 301,
+        TAG_SVD_ROT_META = 302,
+        TAG_SVD_ROT_INT = 303,
+        TAG_SVD_ROT_DOUBLE = 304,
+        TAG_SVD_NEW_BLOCKS = 305,
+        TAG_STOP = 399
+    };
+
+    struct RotationRecord
+    {
+        int type;   // 0 表示右旋，1 表示左旋
+        int idx;    // 作用在 idx 和 idx+1
+        double c;
+        double s;
+    };
+
+    struct LocalBlock
+{
+    int l;
+    int r;
+};
+
+    static int g_mpi_rank = 0;
+    static int g_mpi_size = 1;
+
+    static int g_mpi_svd_tasks = 0;
+    static int g_mpi_total_rotations = 0;
+    static double g_mpi_send_time = 0.0;
+    static double g_mpi_recv_time = 0.0;
+    static double g_mpi_worker_compute_time = 0.0;
+
+    // 更细的 profiling：用于分析 MPI 通信、数据拷贝、master 合并与任务池调度开销。
+    static double g_mpi_pack_time = 0.0;       // master 打包局部子矩阵数据的时间
+    static double g_mpi_replay_time = 0.0;     // master 重放旋转并更新 B/U/V 的时间
+    static double g_mpi_task_pool_time = 0.0;  // master 管理任务池 while 循环的时间
+
+    static long long g_mpi_sent_int_count = 0;
+    static long long g_mpi_sent_double_count = 0;
+    static long long g_mpi_recv_int_count = 0;
+    static long long g_mpi_recv_double_count = 0;
+
+    static int g_mpi_total_worker_dispatches = 0;
+    static int g_mpi_max_task_pool_size = 0;
+
+    // 每个 worker 的负载统计，用来观察负载均衡。
+    static std::vector<int> g_worker_task_count;
+    static std::vector<long long> g_worker_rotation_count;
+    static std::vector<double> g_worker_compute_time;
+
+    // 统计 worker 结束任务的原因：1=收敛，2=分裂，3=达到安全上限
+    static int g_mpi_tasks_all_singletons = 0;
+    static int g_mpi_tasks_split = 0;
+    static int g_mpi_tasks_hit_step_limit = 0;
+    static int g_mpi_returned_child_blocks = 0;
+    static int g_mpi_requeued_blocks = 0;
+    static int g_mpi_max_actual_steps = 0;
+
+    static void mpi_worker_loop();
+
+        static void mpi_send_stop_to_workers()
+    {
+        if (g_mpi_rank != 0 || g_mpi_size <= 1)
+        {
+            return;
+        }
+
+        int dummy[4] = {-1, -1, -1, -1};
+
+        for (int rank = 1; rank < g_mpi_size; ++rank)
+        {
+            MPI_Send(dummy, 4, MPI_INT, rank, TAG_STOP, MPI_COMM_WORLD);
+        }
+    }
+
+    static void finalize_mpi_at_exit()
+    {
+        int initialized = 0;
+        int finalized = 0;
+
+        MPI_Initialized(&initialized);
+        MPI_Finalized(&finalized);
+
+        if (initialized && !finalized)
+        {
+            if (g_mpi_rank == 0)
+            {
+                std::cerr << "[MPI SVD] worker block tasks = "
+                          << g_mpi_svd_tasks << std::endl;
+
+                std::cerr << "[MPI SVD] returned rotations = "
+                          << g_mpi_total_rotations << std::endl;
+
+                std::cerr << "[MPI SVD] master send time(ms) = "
+                          << g_mpi_send_time * 1000.0 << std::endl;
+
+                std::cerr << "[MPI SVD] master recv/wait time(ms) = "
+                          << g_mpi_recv_time * 1000.0 << std::endl;
+
+                std::cerr << "[MPI SVD] worker rotation compute time sum(ms) = "
+                          << g_mpi_worker_compute_time * 1000.0 << std::endl;
+
+                std::cerr << "[MPI SVD] tasks ended by all-singletons = "
+                          << g_mpi_tasks_all_singletons << std::endl;
+
+                std::cerr << "[MPI SVD] tasks ended by split = "
+                          << g_mpi_tasks_split << std::endl;
+
+                std::cerr << "[MPI SVD] tasks hit safety limit = "
+                          << g_mpi_tasks_hit_step_limit << std::endl;
+
+                std::cerr << "[MPI SVD] returned child blocks = "
+                          << g_mpi_returned_child_blocks << std::endl;
+
+                std::cerr << "[MPI SVD] requeued child blocks = "
+                          << g_mpi_requeued_blocks << std::endl;
+
+                std::cerr << "[MPI SVD] max actual local steps = "
+                          << g_mpi_max_actual_steps << std::endl;
+
+                std::cerr << "[MPI Profiling] pack time(ms) = "
+                          << g_mpi_pack_time * 1000.0 << std::endl;
+
+                std::cerr << "[MPI Profiling] replay time(ms) = "
+                          << g_mpi_replay_time * 1000.0 << std::endl;
+
+                std::cerr << "[MPI Profiling] task pool time(ms) = "
+                          << g_mpi_task_pool_time * 1000.0 << std::endl;
+
+                std::cerr << "[MPI Profiling] total worker dispatches = "
+                          << g_mpi_total_worker_dispatches << std::endl;
+
+                std::cerr << "[MPI Profiling] sent int count = "
+                          << g_mpi_sent_int_count << std::endl;
+
+                std::cerr << "[MPI Profiling] sent double count = "
+                          << g_mpi_sent_double_count << std::endl;
+
+                std::cerr << "[MPI Profiling] received int count = "
+                          << g_mpi_recv_int_count << std::endl;
+
+                std::cerr << "[MPI Profiling] received double count = "
+                          << g_mpi_recv_double_count << std::endl;
+
+                std::cerr << "[MPI Profiling] max task pool size = "
+                          << g_mpi_max_task_pool_size << std::endl;
+
+                if (!g_worker_task_count.empty())
+                {
+                    for (int rank = 1; rank < g_mpi_size; ++rank)
+                    {
+                        std::cerr << "[MPI LoadBalance] worker " << rank
+                                  << ": tasks = " << g_worker_task_count[rank]
+                                  << ", rotations = " << g_worker_rotation_count[rank]
+                                  << ", compute_time(ms) = "
+                                  << g_worker_compute_time[rank] * 1000.0
+                                  << std::endl;
+                    }
+                }
+
+                mpi_send_stop_to_workers();
+            }
+
+            MPI_Finalize();
+        }
+    }
+
+    struct MpiBootstrap
+    {
+        MpiBootstrap()
+        {
+            int initialized = 0;
+            MPI_Initialized(&initialized);
+
+            if (!initialized)
+            {
+                MPI_Init(nullptr, nullptr);
+            }
+
+            MPI_Comm_rank(MPI_COMM_WORLD, &g_mpi_rank);
+            MPI_Comm_size(MPI_COMM_WORLD, &g_mpi_size);
+
+            if (g_mpi_rank == 0)
+            {
+                g_worker_task_count.assign(g_mpi_size, 0);
+                g_worker_rotation_count.assign(g_mpi_size, 0);
+                g_worker_compute_time.assign(g_mpi_size, 0.0);
+            }
+
+            if (g_mpi_rank != 0)
+            {
+                std::cerr << "[MPI] worker rank " << g_mpi_rank
+                          << " started, mpi_size = " << g_mpi_size
+                          << ", enters SVD worker loop before main." << std::endl;
+
+                mpi_worker_loop();
+
+                finalize_mpi_at_exit();
+
+                std::_Exit(0);
+            }
+
+            std::cerr << "[MPI] master rank 0 started, mpi_size = "
+                      << g_mpi_size << std::endl;
+
+            std::atexit(finalize_mpi_at_exit);
+        }
+    };
+
+    static MpiBootstrap g_mpi_bootstrap;
+
+    // 对矩阵 M 的两行 r0, r1 左乘 Givens 旋转 [c s; -s c]。
+    // 即 M <- L * M，其中 L 只作用在第 r0/r1 两行上。
+    // 这类逐元素线性组合很适合向量化，SIMD/多线程中你也可以顺手的事把他们做了。
+    static void apply_left_rows(Matrix &M, int r0, int r1, double c, double s)
+    {
+        for (int j = 0; j < M.cols(); ++j)
+        {
+            double a = M.at(r0, j);
+            double b = M.at(r1, j);
+            M.at(r0, j) = c * a + s * b;
+            M.at(r1, j) = -s * a + c * b;
+        }
+    }
+    //下面是apply_left_rows的SIMD优化
+//     static void apply_left_rows(Matrix &M, int r0, int r1, double c, double s)
+// {
+//     const int cols = M.cols();
+
+//     double *row0 = &M.at(r0, 0);
+//     double *row1 = &M.at(r1, 0);
+
+//     int j = 0;
+
+//     float64x2_t vc = vdupq_n_f64(c);
+//     float64x2_t vs = vdupq_n_f64(s);
+//     float64x2_t vneg_s = vdupq_n_f64(-s);
+
+//     for (; j + 1 < cols; j += 2)
+//     {
+//         float64x2_t a = vld1q_f64(row0 + j);
+//         float64x2_t b = vld1q_f64(row1 + j);
+
+//         float64x2_t new0 = vaddq_f64(vmulq_f64(vc, a), vmulq_f64(vs, b));
+//         float64x2_t new1 = vaddq_f64(vmulq_f64(vneg_s, a), vmulq_f64(vc, b));
+
+//         vst1q_f64(row0 + j, new0);
+//         vst1q_f64(row1 + j, new1);
+//     }
+
+//     for (; j < cols; ++j)
+//     {
+//         double a = row0[j];
+//         double b = row1[j];
+//         row0[j] = c * a + s * b;
+//         row1[j] = -s * a + c * b;
+//     }
+// }
+
+    // 对矩阵 M 的两列 c0, c1 右乘 Givens 旋转 [c s; -s c]。
+    // 即 M <- M * R，其中 R 只作用在第 c0/c1 两列上。
+    static void apply_right_cols(Matrix &M, int c0, int c1, double c, double s)
+    {
+        for (int i = 0; i < M.rows(); ++i)
+        {
+            double a = M.at(i, c0);
+            double b = M.at(i, c1);
+            M.at(i, c0) = a * c - b * s;
+            M.at(i, c1) = a * s + b * c;
+        }
+    }
+    //优化下面
+//     static void apply_right_cols(Matrix &M, int c0, int c1, double c, double s)
+// {
+//     // 当前 GKH 调用中 c0 和 c1 通常是相邻列。
+//     // 相邻时，M.at(i,c0) 和 M.at(i,c1) 在同一行内连续存储，
+//     // 可以一次加载为 [a,b] 做 2 路 double SIMD。
+//     if (c1 == c0 + 1)
+//     {
+//         const int rows = M.rows();
+
+//         float64x2_t vc = vdupq_n_f64(c);
+
+//         double sign_s_arr[2] = {-s, s};
+//         float64x2_t vs = vld1q_f64(sign_s_arr);
+
+//         for (int i = 0; i < rows; ++i)
+//         {
+//             double *ptr = &M.at(i, c0);
+
+//             // ab = [a, b]
+//             float64x2_t ab = vld1q_f64(ptr);
+
+//             // ba = [b, a]
+//             float64x2_t ba = vextq_f64(ab, ab, 1);
+
+//             // result = [a,b]*[c,c] + [b,a]*[-s,s]
+//             //        = [a*c - b*s, b*c + a*s]
+//             float64x2_t result = vaddq_f64(
+//                 vmulq_f64(ab, vc),
+//                 vmulq_f64(ba, vs)
+//             );
+
+//             vst1q_f64(ptr, result);
+//         }
+//     }
+//     else
+//     {
+//         // 保险起见：如果以后出现非相邻列调用，回退到原始串行版本
+//         for (int i = 0; i < M.rows(); ++i)
+//         {
+//             double a = M.at(i, c0);
+//             double b = M.at(i, c1);
+//             M.at(i, c0) = a * c - b * s;
+//             M.at(i, c1) = a * s + b * c;
+//         }
+//     }
+// }
+
+    static void accumulate_left_into_U(Matrix &U, int r0, int r1, double c, double s)
+    {
+        // 我们该怎样积累 U 和 V 的更新呢？
+        // 以此处 U 的积累为例，让我们B <- L * B 时，我们必须维护的等式是 A = U * B * V^T
+        // 如果 A = U * B * V^T 不成立，那么我们最终的SVD结果显然不是 A 的正确分解。
+        // 由于正交矩阵和其转置的乘积是I，一个自然的想法是让 U <- U * L^T。
+        // 这样就变成 A = (U * L^T) * (L * B) * V^T = U * B * V^T，等式得以保持。
+
+        // 由于 L^T = [c -s; s c]，此处复用“右乘两列”接口并传入 -s。
+        apply_right_cols(U, r0, r1, c, -s);
+    }
+
+        static void replay_rotation_on_global(Matrix &U,
+                                          Matrix &B,
+                                          Matrix &V,
+                                          const RotationRecord &rot)
+    {
+        if (rot.type == 0)
+        {
+            apply_right_cols(B, rot.idx, rot.idx + 1, rot.c, rot.s);
+            apply_right_cols(V, rot.idx, rot.idx + 1, rot.c, rot.s);
+        }
+        else
+        {
+            apply_left_rows(B, rot.idx, rot.idx + 1, rot.c, rot.s);
+            accumulate_left_into_U(U, rot.idx, rot.idx + 1, rot.c, rot.s);
+        }
+    }
+
+    static bool mpi_one_block_step_by_worker(Matrix &U,
+                                         Matrix &B,
+                                         Matrix &V,
+                                         int l,
+                                         int r,
+                                         int worker_rank,
+                                         double tol,
+                                         std::vector<Block> &returned_blocks)
+    {
+        returned_blocks.clear();
+        if (g_mpi_rank != 0 || g_mpi_size <= 1)
+        {
+            return false;
+        }
+
+        if (worker_rank <= 0 || worker_rank >= g_mpi_size)
+        {
+            return false;
+        }
+
+        if (r <= l)
+        {
+            return true;
+        }
+
+        const int q = r - l + 1;
+
+        int meta[4];
+        // 让 worker 用循环方式尽量把当前子矩阵处理到“收敛或分裂”。
+        // 这里的上限只是安全保护，正常情况下应由收敛/分裂条件退出。
+        const int max_local_steps = 1000000;
+
+        meta[0] = l;
+        meta[1] = r;
+        meta[2] = q;
+        meta[3] = max_local_steps;
+
+        const double pack_begin = MPI_Wtime();
+
+        std::vector<double> diag_super(2 * q, 0.0);
+
+        for (int i = 0; i < q; ++i)
+        {
+            diag_super[i] = B.at(l + i, l + i);
+        }
+
+        for (int i = 0; i < q - 1; ++i)
+        {
+            diag_super[q + i] = B.at(l + i, l + i + 1);
+        }
+
+        diag_super[2 * q - 1] = tol;
+
+        const double pack_end = MPI_Wtime();
+        g_mpi_pack_time += (pack_end - pack_begin);
+
+        double t0 = MPI_Wtime();
+
+        MPI_Send(meta, 4, MPI_INT, worker_rank,
+                 TAG_SVD_BLOCK_TASK, MPI_COMM_WORLD);
+
+        MPI_Send(diag_super.data(),
+                 static_cast<int>(diag_super.size()),
+                 MPI_DOUBLE,
+                 worker_rank,
+                 TAG_SVD_BLOCK_DATA,
+                 MPI_COMM_WORLD);
+
+        double t1 = MPI_Wtime();
+        g_mpi_send_time += (t1 - t0);
+        g_mpi_sent_int_count += 4;
+        g_mpi_sent_double_count += static_cast<long long>(diag_super.size());
+        ++g_mpi_total_worker_dispatches;
+
+        int rot_meta[6] = {0, 0, 0, 0, 0, 0};
+
+        t0 = MPI_Wtime();
+
+        MPI_Recv(rot_meta, 6, MPI_INT, worker_rank,
+                 TAG_SVD_ROT_META, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        g_mpi_recv_int_count += 6;
+
+        const int rot_count = rot_meta[0];
+        const int new_block_count = rot_meta[3];
+        const int actual_steps = rot_meta[4];
+        const int end_reason = rot_meta[5];
+
+        if (actual_steps > g_mpi_max_actual_steps)
+        {
+            g_mpi_max_actual_steps = actual_steps;
+        }
+        if (end_reason == 1)
+        {
+            ++g_mpi_tasks_all_singletons;
+        }
+        else if (end_reason == 2)
+        {
+            ++g_mpi_tasks_split;
+        }
+        else if (end_reason == 3)
+        {
+            ++g_mpi_tasks_hit_step_limit;
+        }
+
+        if (new_block_count > 0)
+        {
+            std::vector<int> block_data(2 * new_block_count);
+
+            MPI_Recv(block_data.data(),
+                     static_cast<int>(block_data.size()),
+                     MPI_INT,
+                     worker_rank,
+                     TAG_SVD_NEW_BLOCKS,
+                     MPI_COMM_WORLD,
+                     MPI_STATUS_IGNORE);
+
+            g_mpi_recv_int_count += static_cast<long long>(block_data.size());
+
+            for (int i = 0; i < new_block_count; ++i)
+            {
+                Block nb;
+                nb.l = block_data[2 * i];
+                nb.r = block_data[2 * i + 1];
+
+                if (nb.r > nb.l)
+                {
+                    returned_blocks.push_back(nb);
+                    ++g_mpi_returned_child_blocks;
+                }
+            }
+        }
+
+        ++g_mpi_svd_tasks;
+
+        if (worker_rank >= 0 && worker_rank < static_cast<int>(g_worker_task_count.size()))
+        {
+            g_worker_task_count[worker_rank] += 1;
+        }
+
+        if (rot_count <= 0)
+        {
+            t1 = MPI_Wtime();
+            g_mpi_recv_time += (t1 - t0);
+            return true;
+        }
+
+        std::vector<int> rot_int(2 * rot_count);
+        std::vector<double> rot_double(2 * rot_count + 1);
+
+        MPI_Recv(rot_int.data(),
+                 static_cast<int>(rot_int.size()),
+                 MPI_INT,
+                 worker_rank,
+                 TAG_SVD_ROT_INT,
+                 MPI_COMM_WORLD,
+                 MPI_STATUS_IGNORE);
+
+        MPI_Recv(rot_double.data(),
+                 static_cast<int>(rot_double.size()),
+                 MPI_DOUBLE,
+                 worker_rank,
+                 TAG_SVD_ROT_DOUBLE,
+                 MPI_COMM_WORLD,
+                 MPI_STATUS_IGNORE);
+
+        t1 = MPI_Wtime();
+        g_mpi_recv_time += (t1 - t0);
+
+        g_mpi_recv_int_count += static_cast<long long>(rot_int.size());
+        g_mpi_recv_double_count += static_cast<long long>(rot_double.size());
+
+        const double worker_compute_time = rot_double[2 * rot_count];
+        g_mpi_worker_compute_time += worker_compute_time;
+        g_mpi_total_rotations += rot_count;
+
+        if (worker_rank >= 0 && worker_rank < static_cast<int>(g_worker_task_count.size()))
+        {
+            g_worker_rotation_count[worker_rank] += rot_count;
+            g_worker_compute_time[worker_rank] += worker_compute_time;
+        }
+
+        const double replay_begin = MPI_Wtime();
+
+        for (int i = 0; i < rot_count; ++i)
+        {
+            RotationRecord rot;
+            rot.type = rot_int[2 * i];
+            rot.idx = rot_int[2 * i + 1];
+            rot.c = rot_double[2 * i];
+            rot.s = rot_double[2 * i + 1];
+
+            replay_rotation_on_global(U, B, V, rot);
+        }
+
+        const double replay_end = MPI_Wtime();
+        g_mpi_replay_time += (replay_end - replay_begin);
+
+        return true;
+    }
+
+    // 计算活动块 [l, r] 对应 B^T B 右下 2x2 主子块的 Wilkinson 偏移。
+    // 偏移用于加速 QR 迭代收敛，并让 bulge chasing 过程更稳定。
+    static double block_wilkinson_shift(const Matrix &B, int l, int r)
+    {
+        if (r == l)
+        {
+            return B.at(l, l) * B.at(l, l);
+        }
+
+        const double d1 = B.at(r - 1, r - 1);
+        const double e1 = B.at(r - 1, r);
+        const double d2 = B.at(r, r);
+        const double e0 = (r - 1 > l) ? B.at(r - 2, r - 1) : 0.0;
+
+        const double a = d1 * d1 + e0 * e0;
+        const double b = d1 * e1;
+        const double d = d2 * d2 + e1 * e1;
+
+        const double tr = a + d;
+        const double det = a * d - b * b;
+        double disc = 0.25 * tr * tr - det;
+        if (disc < 0.0)
+        {
+            disc = 0.0;
+        }
+
+        const double root = std::sqrt(disc);
+        const double lam1 = 0.5 * tr + root;
+        const double lam2 = 0.5 * tr - root;
+        return (std::fabs(lam1 - d) <= std::fabs(lam2 - d)) ? lam1 : lam2;
+    }
+
+    // 将上二对角结构以外、且绝对值很小的元素强制置零。
+    static void cleanup_bidiagonal(Matrix &B, double tol)
+    {
+        for (int i = 0; i < B.rows(); ++i)
+        {
+            for (int j = 0; j < B.cols(); ++j)
+            {
+                if (j != i && j != i + 1 && std::fabs(B.at(i, j)) <= tol)
+                {
+                    B.at(i, j) = 0.0;
+                }
+            }
+        }
+    }
+
+    // 对活动块 [l, r] 执行一次“单块 GKH bulge chasing”迭代。
+    // 流程：首次右乘引入 bulge -> 首次左乘消 bulge -> 交替右乘/左乘将 bulge 追赶到块末端。
+    static void one_block_step(Matrix &U, Matrix &B, Matrix &V, int l, int r)
+    {
+        if (r <= l)
+        {
+            return;
+        }
+
+        const double mu = block_wilkinson_shift(B, l, r);
+
+        double c = 1.0;
+        double s = 0.0;
+        double rr = 0.0;
+
+        // 首次右乘：由 (d_l^2-mu, d_l*e_l) 构造。
+        const double x = B.at(l, l) * B.at(l, l) - mu;
+        const double z = B.at(l, l) * B.at(l, l + 1);
+        givens_rotation(x, z, c, s, rr, false);
+        apply_right_cols(B, l, l + 1, c, s);
+        apply_right_cols(V, l, l + 1, c, s);
+
+        // 首次左乘：消去 (l+1, l)。
+        givens_rotation(B.at(l, l), B.at(l + 1, l), c, s, rr, true);
+        apply_left_rows(B, l, l + 1, c, s);
+        accumulate_left_into_U(U, l, l + 1, c, s);
+
+        for (int k = l + 1; k <= r - 1; ++k)
+        {
+            // 右乘：消去 (k-1, k+1)
+            givens_rotation(B.at(k - 1, k), B.at(k - 1, k + 1), c, s, rr, false);
+            apply_right_cols(B, k, k + 1, c, s);
+            apply_right_cols(V, k, k + 1, c, s);
+
+            // 左乘：消去 (k+1, k)
+            givens_rotation(B.at(k, k), B.at(k + 1, k), c, s, rr, true);
+            apply_left_rows(B, k, k + 1, c, s);
+            accumulate_left_into_U(U, k, k + 1, c, s);
+        }
+    }
+
+        static inline double &local_at(std::vector<double> &M, int q, int i, int j)
+    {
+        return M[i * q + j];
+    }
+
+    static inline double local_at_const(const std::vector<double> &M, int q, int i, int j)
+    {
+        return M[i * q + j];
+    }
+
+        static void local_apply_right_cols(std::vector<double> &M,
+                                       int q,
+                                       int c0,
+                                       int c1,
+                                       double c,
+                                       double s)
+    {
+        for (int i = 0; i < q; ++i)
+        {
+            double a = local_at(M, q, i, c0);
+            double b = local_at(M, q, i, c1);
+            local_at(M, q, i, c0) = a * c - b * s;
+            local_at(M, q, i, c1) = a * s + b * c;
+        }
+    }
+
+    static void local_apply_left_rows(std::vector<double> &M,
+                                      int q,
+                                      int r0,
+                                      int r1,
+                                      double c,
+                                      double s)
+    {
+        for (int j = 0; j < q; ++j)
+        {
+            double a = local_at(M, q, r0, j);
+            double b = local_at(M, q, r1, j);
+            local_at(M, q, r0, j) = c * a + s * b;
+            local_at(M, q, r1, j) = -s * a + c * b;
+        }
+    }
+
+        static double local_block_wilkinson_shift(const std::vector<double> &B,
+                                              int q,
+                                              int l,
+                                              int r)
+    {
+        if (r == l)
+        {
+            return local_at_const(B, q, l, l) * local_at_const(B, q, l, l);
+        }
+
+        const double d1 = local_at_const(B, q, r - 1, r - 1);
+        const double e1 = local_at_const(B, q, r - 1, r);
+        const double d2 = local_at_const(B, q, r, r);
+        const double e0 = (r - 1 > l) ? local_at_const(B, q, r - 2, r - 1) : 0.0;
+
+        const double a = d1 * d1 + e0 * e0;
+        const double b = d1 * e1;
+        const double d = d2 * d2 + e1 * e1;
+
+        const double tr = a + d;
+        const double det = a * d - b * b;
+        double disc = 0.25 * tr * tr - det;
+
+        if (disc < 0.0)
+        {
+            disc = 0.0;
+        }
+
+        const double root = std::sqrt(disc);
+        const double lam1 = 0.5 * tr + root;
+        const double lam2 = 0.5 * tr - root;
+
+        return (std::fabs(lam1 - d) <= std::fabs(lam2 - d)) ? lam1 : lam2;
+    }
+
+    static void local_cleanup_bidiagonal(std::vector<double> &B, int q, double tol)
+{
+    for (int i = 0; i < q; ++i)
+    {
+        for (int j = 0; j < q; ++j)
+        {
+            if (j != i && j != i + 1 && std::fabs(local_at(B, q, i, j)) <= tol)
+            {
+                local_at(B, q, i, j) = 0.0;
+            }
+        }
+    }
+}
+    
+        static bool local_block_has_new_split(std::vector<double> &B, int q, double tol)
+{
+    if (q <= 1)
+    {
+        return true;
+    }
+
+    bool split_found = false;
+
+    for (int k = 0; k < q - 1; ++k)
+    {
+        const double a = std::fabs(local_at(B, q, k, k));
+        const double d = std::fabs(local_at(B, q, k + 1, k + 1));
+        const double crit = tol * (a + d + 1.0);
+
+        if (std::fabs(local_at(B, q, k, k + 1)) <= crit)
+        {
+            local_at(B, q, k, k + 1) = 0.0;
+            split_found = true;
+        }
+    }
+
+    return split_found;
+}
+ 
+    static bool local_block_all_singletons(std::vector<double> &B, int q, double tol)
+{
+    if (q <= 1)
+    {
+        return true;
+    }
+
+    bool all_zero = true;
+
+    for (int k = 0; k < q - 1; ++k)
+    {
+        const double a = std::fabs(local_at(B, q, k, k));
+        const double d = std::fabs(local_at(B, q, k + 1, k + 1));
+        const double crit = tol * (a + d + 1.0);
+
+        if (std::fabs(local_at(B, q, k, k + 1)) <= crit)
+        {
+            local_at(B, q, k, k + 1) = 0.0;
+        }
+        else
+        {
+            all_zero = false;
+        }
+    }
+
+    return all_zero;
+}
+
+        static std::vector<LocalBlock> local_split_active_blocks(std::vector<double> &B,
+                                                         int q,
+                                                         double tol)
+{
+    for (int k = 0; k < q - 1; ++k)
+    {
+        const double a = std::fabs(local_at(B, q, k, k));
+        const double d = std::fabs(local_at(B, q, k + 1, k + 1));
+        const double crit = tol * (a + d + 1.0);
+
+        if (std::fabs(local_at(B, q, k, k + 1)) <= crit)
+        {
+            local_at(B, q, k, k + 1) = 0.0;
+        }
+    }
+
+    std::vector<LocalBlock> blocks;
+
+    int l = 0;
+    while (l < q)
+    {
+        int r = l;
+
+        while (r < q - 1 && std::fabs(local_at(B, q, r, r + 1)) > 0.0)
+        {
+            ++r;
+        }
+
+        blocks.push_back({l, r});
+        l = r + 1;
+    }
+
+    return blocks;
+}
+
+        static void local_one_block_step_record_rotations(std::vector<double> &local_B,
+                                                      int q,
+                                                      int global_l,
+                                                      std::vector<RotationRecord> &rots)
+    {
+        if (q <= 1)
+        {
+            return;
+        }
+
+        const int l = 0;
+        const int r = q - 1;
+
+        const double mu = local_block_wilkinson_shift(local_B, q, l, r);
+
+        double c = 1.0;
+        double s = 0.0;
+        double rr = 0.0;
+
+        const double x = local_at(local_B, q, l, l) * local_at(local_B, q, l, l) - mu;
+        const double z = local_at(local_B, q, l, l) * local_at(local_B, q, l, l + 1);
+
+        givens_rotation(x, z, c, s, rr, false);
+
+        rots.push_back({0, global_l + l, c, s});
+        local_apply_right_cols(local_B, q, l, l + 1, c, s);
+
+        givens_rotation(local_at(local_B, q, l, l),
+                        local_at(local_B, q, l + 1, l),
+                        c, s, rr, true);
+
+        rots.push_back({1, global_l + l, c, s});
+        local_apply_left_rows(local_B, q, l, l + 1, c, s);
+
+        for (int k = l + 1; k <= r - 1; ++k)
+        {
+            givens_rotation(local_at(local_B, q, k - 1, k),
+                            local_at(local_B, q, k - 1, k + 1),
+                            c, s, rr, false);
+
+            rots.push_back({0, global_l + k, c, s});
+            local_apply_right_cols(local_B, q, k, k + 1, c, s);
+
+            givens_rotation(local_at(local_B, q, k, k),
+                            local_at(local_B, q, k + 1, k),
+                            c, s, rr, true);
+
+            rots.push_back({1, global_l + k, c, s});
+            local_apply_left_rows(local_B, q, k, k + 1, c, s);
+        }
+    }
+
+    static int local_multi_step_record_rotations(std::vector<double> &local_B,
+                                                 int q,
+                                                 int global_l,
+                                                 int max_local_steps,
+                                                 double tol,
+                                                 std::vector<RotationRecord> &rots,
+                                                 std::vector<LocalBlock> &new_blocks,
+                                                 int &end_reason)
+    {
+        int actual_steps = 0;
+        end_reason = 0;
+
+        if (q <= 1)
+        {
+            new_blocks.push_back({0, 0});
+            end_reason = 1;
+            return actual_steps;
+        }
+
+        while (true)
+        {
+            if (local_block_all_singletons(local_B, q, tol))
+            {
+                end_reason = 1; // 当前子矩阵已经全部收敛为 1x1
+                break;
+            }
+
+            if (actual_steps >= max_local_steps)
+            {
+                end_reason = 3; // 极端情况下的安全退出，避免死循环
+                break;
+            }
+
+            local_one_block_step_record_rotations(local_B, q, global_l, rots);
+            ++actual_steps;
+
+            local_cleanup_bidiagonal(local_B, q, tol);
+
+            if (local_block_has_new_split(local_B, q, tol))
+            {
+                end_reason = 2; // 当前子矩阵已经分裂，可以交还给 master 继续调度子块
+                break;
+            }
+        }
+
+        new_blocks = local_split_active_blocks(local_B, q, tol);
+
+        if (end_reason == 0)
+        {
+            end_reason = local_block_all_singletons(local_B, q, tol) ? 1 : 2;
+        }
+
+        return actual_steps;
+    }
+
+        static void mpi_worker_loop()
+    {
+        while (true)
+        {
+            int meta[4] = {0, 0, 0, 0};
+            MPI_Status status;
+
+            MPI_Recv(meta, 4, MPI_INT, 0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+
+            if (status.MPI_TAG == TAG_STOP)
+            {
+                break;
+            }
+
+            if (status.MPI_TAG == TAG_SVD_BLOCK_TASK)
+            {
+                const int global_l = meta[0];
+                const int global_r = meta[1];
+                const int q = meta[2];
+                const int max_local_steps = meta[3];
+
+                std::vector<double> diag_super(2 * q, 0.0);
+
+                MPI_Recv(diag_super.data(),
+                         static_cast<int>(diag_super.size()),
+                         MPI_DOUBLE,
+                         0,
+                         TAG_SVD_BLOCK_DATA,
+                         MPI_COMM_WORLD,
+                         MPI_STATUS_IGNORE);
+
+                std::vector<double> local_B(q * q, 0.0);
+
+                for (int i = 0; i < q; ++i)
+                {
+                    local_at(local_B, q, i, i) = diag_super[i];
+                }
+
+                for (int i = 0; i < q - 1; ++i)
+                {
+                    local_at(local_B, q, i, i + 1) = diag_super[q + i];
+                }
+
+                const double tol = diag_super[2 * q - 1];
+
+                std::vector<RotationRecord> rots;
+                std::vector<LocalBlock> new_blocks;
+
+                const double t0 = MPI_Wtime();
+
+                int end_reason = 0;
+                const int actual_steps = local_multi_step_record_rotations(local_B,
+                                                                           q,
+                                                                           global_l,
+                                                                           max_local_steps,
+                                                                           tol,
+                                                                           rots,
+                                                                           new_blocks,
+                                                                           end_reason);
+
+                const double t1 = MPI_Wtime();
+                const double compute_time = t1 - t0;
+
+                int rot_meta[6];
+                rot_meta[0] = static_cast<int>(rots.size());
+                rot_meta[1] = global_l;
+                rot_meta[2] = global_r;
+                rot_meta[3] = static_cast<int>(new_blocks.size());
+                rot_meta[4] = actual_steps;
+                rot_meta[5] = end_reason;
+
+                MPI_Send(rot_meta, 6, MPI_INT, 0,
+                         TAG_SVD_ROT_META, MPI_COMM_WORLD);
+
+                if (!new_blocks.empty())
+{
+    std::vector<int> block_data(2 * new_blocks.size());
+
+    for (int i = 0; i < static_cast<int>(new_blocks.size()); ++i)
+    {
+        block_data[2 * i] = global_l + new_blocks[i].l;
+        block_data[2 * i + 1] = global_l + new_blocks[i].r;
+    }
+
+    MPI_Send(block_data.data(),
+             static_cast<int>(block_data.size()),
+             MPI_INT,
+             0,
+             TAG_SVD_NEW_BLOCKS,
+             MPI_COMM_WORLD);
+}
+
+                if (!rots.empty())
+                {
+                    std::vector<int> rot_int(2 * rots.size());
+                    std::vector<double> rot_double(2 * rots.size() + 1);
+
+                    for (int i = 0; i < static_cast<int>(rots.size()); ++i)
+                    {
+                        rot_int[2 * i] = rots[i].type;
+                        rot_int[2 * i + 1] = rots[i].idx;
+
+                        rot_double[2 * i] = rots[i].c;
+                        rot_double[2 * i + 1] = rots[i].s;
+                    }
+
+                    rot_double[2 * rots.size()] = compute_time;
+
+                    MPI_Send(rot_int.data(),
+                             static_cast<int>(rot_int.size()),
+                             MPI_INT,
+                             0,
+                             TAG_SVD_ROT_INT,
+                             MPI_COMM_WORLD);
+
+                    MPI_Send(rot_double.data(),
+                             static_cast<int>(rot_double.size()),
+                             MPI_DOUBLE,
+                             0,
+                             TAG_SVD_ROT_DOUBLE,
+                             MPI_COMM_WORLD);
+                }
+            }
+        }
+    }
+
+    // 处理“对角元 d_k 近零但超对角 e_k 未近零”的情况。
+    // 思路与单块追赶类似：先右乘把 e_i 消掉，再左乘清理新引入的次对角 bulge，
+    // 把这个问题逐步向右传递，直到块末端。
+    static bool chase_zero_diagonal(Matrix &U, Matrix &B, Matrix &V, int k, double tol)
+    {
+        const int m = B.rows();
+        const int n = B.cols();
+        if (k < 0 || k >= n - 1)
+        {
+            return false;
+        }
+
+        // d_k ~ 0 且 e_k 还未收敛时，按 lim_1 思路进行压缩追赶：
+        // 1) 右乘消去第 k 行的 e_k；2) 左乘消去引入的次对角 bulge；
+        // 然后把问题传递到下一行，直到末端。
+        if (std::fabs(B.at(k, k + 1)) <= tol)
+        {
+            return false;
+        }
+
+        bool changed = false;
+        for (int i = k; i <= n - 2; ++i)
+        {
+            double c = 1.0;
+            double s = 0.0;
+            double rr = 0.0;
+
+            // 右乘：使第 i 行满足 [d_i, e_i] * G = [r, 0]。
+            givens_rotation(B.at(i, i), B.at(i, i + 1), c, s, rr, false);
+            apply_right_cols(B, i, i + 1, c, s);
+            apply_right_cols(V, i, i + 1, c, s);
+
+            // 左乘：消去 (i+1, i) 处由右乘引入的 bulge。
+            if (i + 1 < m)
+            {
+                givens_rotation(B.at(i, i), B.at(i + 1, i), c, s, rr, true);
+                apply_left_rows(B, i, i + 1, c, s);
+                accumulate_left_into_U(U, i, i + 1, c, s);
+            }
+
+            changed = true;
+        }
+
+        cleanup_bidiagonal(B, tol);
+        return changed;
+    }
+
+    // 扫描所有 d_k≈0 的位置：若对应 e_k 仍显著非零，则调用追赶过程压缩该异常结构。
+    // 返回值表示本轮是否对 B/U/V 做了实际更新。
+    static bool handle_diagonal_zeros(Matrix &U, Matrix &B, Matrix &V, double tol)
+    {
+        const int n = B.cols();
+        bool changed = false;
+
+        const double eps = std::numeric_limits<double>::epsilon();
+        const double diag_tol = tol;
+        const double super_tol = tol * (1.0 + 10.0 * eps);
+
+        for (int k = 0; k < n - 1; ++k)
+        {
+            if (std::fabs(B.at(k, k)) <= diag_tol && std::fabs(B.at(k, k + 1)) > super_tol)
+            {
+                if (chase_zero_diagonal(U, B, V, k, tol))
+                {
+                    changed = true;
+                }
+            }
+        }
+
+        return changed;
+    }
+
+    // 根据超对角线是否“足够小”对问题进行分块。
+    // 若 |e_k| <= tol*(|d_k|+|d_{k+1}|+1)，认为该位置可解耦并直接置零。
+    // 最终会得到一系列小矩阵。
+    static std::vector<Block> split_active_blocks(Matrix &B, int n, double tol)
+    {
+        for (int k = 0; k < n - 1; ++k)
+        {
+            const double a = std::fabs(B.at(k, k));
+            const double d = std::fabs(B.at(k + 1, k + 1));
+            const double crit = tol * (a + d + 1.0);
+            if (std::fabs(B.at(k, k + 1)) <= crit)
+            {
+                B.at(k, k + 1) = 0.0;
+            }
+        }
+
+        std::vector<Block> blocks;
+        int l = 0;
+        while (l < n)
+        {
+            int r = l;
+            while (r < n - 1 && std::fabs(B.at(r, r + 1)) > 0.0)
+            {
+                ++r;
+            }
+            blocks.push_back({l, r});
+            l = r + 1;
+        }
+        return blocks;
+    }
+
+    // 收尾步骤：
+    // 1) 把奇异值（对角元）统一调整为非负；
+    // 2) 按降序重排奇异值，同时同步重排 U、V 对应列。
+    // 最终得到常见的 SVD 规范形式：sigma_1 >= sigma_2 >= ... >= 0。
+    // 这个函数你不用太在意，后续任务也不会明确涉及它。
+    static void make_nonnegative_and_sort(Matrix &U, Matrix &B, Matrix &V)
+    {
+        const int m = B.rows();
+        const int n = B.cols();
+
+        for (int i = 0; i < n; ++i)
+        {
+            if (B.at(i, i) < 0.0)
+            {
+                B.at(i, i) = -B.at(i, i);
+                for (int r = 0; r < m; ++r)
+                {
+                    U.at(r, i) = -U.at(r, i);
+                }
+            }
+        }
+
+        std::vector<int> idx(n);
+        for (int i = 0; i < n; ++i)
+        {
+            idx[i] = i;
+        }
+        std::sort(idx.begin(), idx.end(), [&](int a, int b)
+                  { return B.at(a, a) > B.at(b, b); });
+
+        Matrix U2 = U;
+        Matrix V2 = V;
+        Matrix D(B.rows(), B.cols(), 0.0);
+
+        for (int new_i = 0; new_i < n; ++new_i)
+        {
+            const int old_i = idx[new_i];
+            D.at(new_i, new_i) = B.at(old_i, old_i);
+
+            for (int r = 0; r < U.rows(); ++r)
+            {
+                U2.at(r, new_i) = U.at(r, old_i);
+            }
+            for (int r = 0; r < V.rows(); ++r)
+            {
+                V2.at(r, new_i) = V.at(r, old_i);
+            }
+        }
+
+        U = U2;
+        V = V2;
+        B = D;
+    }
+
+} // namespace
+
+// 从“上二对角矩阵 B”出发执行 Golub-Kahan SVD 迭代（改进版）：
+// - 输入输出满足 A = U * B * V^T 不变；
+// - 迭代中自动分块、处理对角近零、并在每个活动块上做 bulge chasing；
+// - 成功收敛后，B 被整理为非负且降序的对角矩阵（其对角元即奇异值）。
+bool gkh_svd_from_bidiagonal(Matrix &U, Matrix &B, Matrix &V, int max_iter, double tol)
+{
+    const int m = B.rows();
+    const int n = B.cols();
+
+    if (m < n)
+    {
+        throw std::invalid_argument("gkh_svd_from_bidiagonal_v2: requires m >= n");
+    }
+    if (U.rows() != m || U.cols() != m)
+    {
+        throw std::invalid_argument("gkh_svd_from_bidiagonal_v2: U must be m x m");
+    }
+    if (V.rows() != n || V.cols() != n)
+    {
+        throw std::invalid_argument("gkh_svd_from_bidiagonal_v2: V must be n x n");
+    }
+
+    bool converged = false;
+
+    for (int iter = 0; iter < max_iter; ++iter)
+    {
+        // 清理数值噪声，并优先处理 d_k≈0 的特殊情形。
+        cleanup_bidiagonal(B, tol);
+        handle_diagonal_zeros(U, B, V, tol);
+
+        // 根据超对角线断点拆分活动块
+        // 这里子矩阵间是相互独立的，所以此处具有很大的并行潜力：你可以尝试多线程/多进程进行处理
+        // 但根据算法，收集 Givens 旋转并更新 U/V 需要在每个块内顺序执行，所以这可能给并行带来麻烦。
+        std::vector<Block> blocks = split_active_blocks(B, n, tol);
+
+        // 若全部是 1x1 块，说明所有超对角都已收敛为 0。
+        bool all_singletons = true;
+        for (const auto &blk : blocks)
+        {
+            if (blk.r > blk.l)
+            {
+                all_singletons = false;
+                break;
+            }
+        }
+
+        if (all_singletons)
+        {
+            converged = true;
+            break;
+        }
+
+        // 任务池版本：master 不再等下一轮全局迭代才处理新分裂块。
+        // worker 处理一个 block 后返回分裂出的新 block，master 立即加入任务池。
+        std::vector<Block> task_pool;
+        for (const auto &blk : blocks)
+        {
+            if (blk.r > blk.l)
+            {
+                task_pool.push_back(blk);
+            }
+        }
+
+        if (static_cast<int>(task_pool.size()) > g_mpi_max_task_pool_size)
+        {
+            g_mpi_max_task_pool_size = static_cast<int>(task_pool.size());
+        }
+
+        int next_worker = 1;
+
+        const double pool_begin = MPI_Wtime();
+
+        while (!task_pool.empty())
+        {
+            Block blk = task_pool.back();
+            task_pool.pop_back();
+
+            if (blk.r <= blk.l)
+            {
+                continue;
+            }
+
+            bool done_by_worker = false;
+            std::vector<Block> returned_blocks;
+
+            if (g_mpi_size > 1)
+            {
+                done_by_worker = mpi_one_block_step_by_worker(U,
+                                                              B,
+                                                              V,
+                                                              blk.l,
+                                                              blk.r,
+                                                              next_worker,
+                                                              tol,
+                                                              returned_blocks);
+
+                ++next_worker;
+                if (next_worker >= g_mpi_size)
+                {
+                    next_worker = 1;
+                }
+            }
+
+            if (!done_by_worker)
+            {
+                one_block_step(U, B, V, blk.l, blk.r);
+                cleanup_bidiagonal(B, tol);
+
+                std::vector<Block> after_blocks = split_active_blocks(B, n, tol);
+                for (const auto &nb : after_blocks)
+                {
+                    if (nb.r > nb.l && nb.l >= blk.l && nb.r <= blk.r)
+                    {
+                        task_pool.push_back(nb);
+                        ++g_mpi_requeued_blocks;
+
+                        if (static_cast<int>(task_pool.size()) > g_mpi_max_task_pool_size)
+                        {
+                            g_mpi_max_task_pool_size = static_cast<int>(task_pool.size());
+                        }
+                    }
+                }
+                continue;
+            }
+
+            cleanup_bidiagonal(B, tol);
+
+            for (const auto &nb : returned_blocks)
+            {
+                if (nb.r > nb.l)
+                {
+                    task_pool.push_back(nb);
+                    ++g_mpi_requeued_blocks;
+
+                    if (static_cast<int>(task_pool.size()) > g_mpi_max_task_pool_size)
+                    {
+                        g_mpi_max_task_pool_size = static_cast<int>(task_pool.size());
+                    }
+                }
+            }
+        }
+
+        const double pool_end = MPI_Wtime();
+        g_mpi_task_pool_time += (pool_end - pool_begin);
+    }
+
+    // 迭代结束后统一结构清理与标准化输出。
+    cleanup_bidiagonal(B, tol);
+    for (int i = 0; i < n - 1; ++i)
+    {
+        B.at(i, i + 1) = 0.0;
+    }
+    make_nonnegative_and_sort(U, B, V);
+
+    return converged;
+}
